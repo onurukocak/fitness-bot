@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: onur-fitness-bot
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # Render dashboard'da elle gir
+      - key: CHAT_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false        # service_role key kullan (anon değil!)
