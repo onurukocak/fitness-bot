@@ -215,7 +215,7 @@ async function handleHelp(chatId) {
 }
 
 // ── WEBHOOK ──────────────────────────────────────────────────────
-app.post(`/webhook/${BOT_TOKEN}`, async (req, res) => {
+app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
     const msg = req.body?.message;
