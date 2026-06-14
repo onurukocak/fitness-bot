@@ -215,7 +215,7 @@ async function handleHelp(chatId) {
 }
 
 // ── WEBHOOK ──────────────────────────────────────────────────────
-app.post("/webhook", async (req, res) => {
+app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const msg = req.body?.message;
@@ -261,56 +261,6 @@ app.get('/api/data', async (req, res) => {
 });
 
 app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-// ── HEALTH AUTO EXPORT — REST API endpoint ───────────────────
-// iPhone'dan Health Auto Export uygulaması bu endpoint'e POST gönderir
-// Otomasyonlar → REST API → URL: https://<render-url>/health-export
-app.post('/health-export', async (req, res) => {
-  res.sendStatus(200); // Hızlı yanıt
-  try {
-    const body = req.body;
-    // Health Auto Export v2 formatı: { data: { metrics: [...] } }
-    const metrics = body?.data?.metrics || body?.metrics || [];
-    if (!metrics.length) return;
-
-    const METRIC_MAP = {
-      'heart_rate_variability_sdnn': 'hrv',
-      'resting_heart_rate':          'rhr',
-      'active_energy_burned':        'active_cal',
-      'step_count':                  'steps',
-      'sleep_analysis':              'sleep',
-      'vo2_max':                     'vo2',
-    };
-
-    // Tarihe göre grupla
-    const byDate = {};
-    for (const metric of metrics) {
-      const field = METRIC_MAP[metric.name];
-      if (!field) continue;
-      for (const dp of (metric.data || [])) {
-        const date = (dp.date || '').split(' ')[0]; // "2026-06-14 00:00:00" → "2026-06-14"
-        if (!date) continue;
-        if (!byDate[date]) byDate[date] = { date };
-        // Uyku: saat cinsinden (dakika geldiyse çevir)
-        if (field === 'sleep') {
-          const val = parseFloat(dp.qty || dp.value || 0);
-          byDate[date][field] = val > 24 ? val / 60 : val; // dakika → saat
-        } else {
-          byDate[date][field] = Math.round(parseFloat(dp.qty || dp.value || 0));
-        }
-      }
-    }
-
-    // Supabase'e upsert
-    for (const row of Object.values(byDate)) {
-      if (Object.keys(row).length <= 1) continue; // sadece date varsa atla
-      await dbInsert('watch_log', row);
-    }
-    console.log(`✅ Health Export: ${Object.keys(byDate).length} gün işlendi`);
-  } catch(e) {
-    console.error('Health export error:', e);
-  }
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Fitness Bot çalışıyor — port ${PORT}`));
