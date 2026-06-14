@@ -1,249 +1,262 @@
 /**
- * Onur Fitness Bot — Telegram Webhook + OpenFoodFacts + Supabase
- * Deploy: Render.com (free tier)
+ * Onur Fitness Bot — Telegram + OpenFoodFacts + Supabase
+ * Deploy: Render.com
  */
 
 const express = require('express');
-const fetch = require('node-fetch');
+const fetch   = require('node-fetch');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json());
 
-// ── ENV ──────────────────────────────────────────────────────────
-const BOT_TOKEN   = process.env.BOT_TOKEN   || '8566167507:AAFuXsuyrVbx20lm0gPZVbvdlHBPew7Dc5k';
-const CHAT_ID     = process.env.CHAT_ID     || '7979693959';
-const SUPABASE_URL= process.env.SUPABASE_URL;
-const SUPABASE_KEY= process.env.SUPABASE_KEY;
-const TG_API      = `https://api.telegram.org/bot${BOT_TOKEN}`;
+// ── CONFIG ────────────────────────────────────────────────────────
+const BOT_TOKEN    = process.env.BOT_TOKEN    || '8566167507:AAFuXsuyrVbx20lm0gPZVbvdlHBPew7Dc5k';
+const CHAT_ID      = process.env.CHAT_ID      || '7979693959';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const TG           = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const KCAL_HEDEF   = 3250;
+const PROTEIN_HEDEF = 233;
 
 const supabase = SUPABASE_URL && SUPABASE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_KEY)
   : null;
 
-// ── HELPERS ──────────────────────────────────────────────────────
+// ── UTILS ─────────────────────────────────────────────────────────
 const today = () => new Date().toISOString().split('T')[0];
+const bar   = (val, max, len = 10) => {
+  const filled = Math.min(Math.round((val / max) * len), len);
+  return '█'.repeat(filled) + '░'.repeat(len - filled);
+};
 
-async function sendMsg(chatId, text, extra = {}) {
-  await fetch(`${TG_API}/sendMessage`, {
+async function send(chatId, text) {
+  await fetch(`${TG}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', ...extra })
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
   });
 }
 
-async function dbInsert(table, data) {
-  if (!supabase) return false;
+async function dbUpsert(table, data) {
+  if (!supabase) return;
   const { error } = await supabase.from(table).upsert(data);
-  return !error;
+  if (error) console.error(`DB error [${table}]:`, error.message);
 }
 
-async function dbGetToday(table) {
+async function dbToday(table) {
   if (!supabase) return null;
   const { data } = await supabase.from(table)
     .select('*').eq('date', today()).order('created_at', { ascending: false }).limit(1);
   return data?.[0] || null;
 }
 
-// ── FOOD SEARCH (OpenFoodFacts) ───────────────────────────────────
+// ── FOOD ──────────────────────────────────────────────────────────
 async function searchFood(query) {
   try {
-    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=3&fields=product_name,nutriments`;
-    const res = await fetch(url);
+    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=5&fields=product_name,nutriments`;
+    const res  = await fetch(url);
     const data = await res.json();
-    const products = (data.products || []).filter(p => p.nutriments?.['energy-kcal_100g']);
-    return products.slice(0, 3).map(p => ({
-      name: p.product_name || query,
-      kcal100: Math.round(p.nutriments['energy-kcal_100g'] || 0),
-      protein100: Math.round(p.nutriments['proteins_100g'] || 0),
-      carb100: Math.round(p.nutriments['carbohydrates_100g'] || 0),
-      fat100: Math.round(p.nutriments['fat_100g'] || 0),
-    }));
+    return (data.products || [])
+      .filter(p => p.nutriments?.['energy-kcal_100g'])
+      .slice(0, 1)
+      .map(p => ({
+        name:     p.product_name || query,
+        kcal:     Math.round(p.nutriments['energy-kcal_100g']    || 0),
+        protein:  Math.round(p.nutriments['proteins_100g']        || 0),
+        carb:     Math.round(p.nutriments['carbohydrates_100g']   || 0),
+        fat:      Math.round(p.nutriments['fat_100g']             || 0),
+      }));
   } catch { return []; }
 }
 
-// ── PARSE FOOD MESSAGE ────────────────────────────────────────────
-// "2 yumurta ve 1 dilim ekmek yedim" → [{item:"yumurta",qty:2,unit:"adet"}, ...]
-function parseFoodText(text) {
-  const cleaned = text.replace(/yedim|içtim|aldım|atladım/gi, '').trim();
-  const parts = cleaned.split(/\s+ve\s+|\s*,\s*/i);
-  return parts.map(part => {
-    const m = part.trim().match(/^(\d+[\.,]?\d*)\s*(gr?|gram|kg|ml|litre|dilim|kase|bardak|adet|tane|porsiyon)?\s*(.+)?$/i);
-    if (m) {
-      return { qty: parseFloat(m[1].replace(',', '.')), unit: m[2] || 'adet', food: (m[3] || '').trim() };
-    }
-    // Sayı yoksa, 1 porsiyon kabul et
-    return { qty: 1, unit: 'porsiyon', food: part.trim() };
-  }).filter(f => f.food.length > 0);
+// "2 yumurta ve 150gr tavuk yedim" → [{qty, unit, food}, ...]
+function parseFood(text) {
+  const clean = text.replace(/yedim|içtim|aldım|atladım/gi, '').trim();
+  return clean.split(/\s+ve\s+|\s*,\s*/i)
+    .map(part => {
+      const m = part.trim().match(/^(\d+[\.,]?\d*)\s*(gr?|gram|kg|ml|litre|dilim|kase|bardak|adet|tane|porsiyon)?\s*(.+)?$/i);
+      if (m) return { qty: parseFloat(m[1].replace(',','.')), unit: m[2]||'adet', food: (m[3]||'').trim() };
+      return { qty: 1, unit: 'porsiyon', food: part.trim() };
+    })
+    .filter(f => f.food.length > 0);
 }
 
-// Gram'a çevir (yaklaşık)
-function toGrams(qty, unit, defaultPortion = 100) {
-  const u = (unit || '').toLowerCase();
-  if (['gr', 'gram', 'g'].includes(u)) return qty;
-  if (u === 'kg') return qty * 1000;
-  if (u === 'ml') return qty;
-  if (u === 'litre') return qty * 1000;
-  if (u === 'dilim') return qty * 30;
-  if (u === 'bardak') return qty * 240;
-  if (u === 'kase') return qty * 200;
-  if (u === 'porsiyon') return qty * defaultPortion;
-  return qty * defaultPortion; // adet / tane
+function toGrams(qty, unit) {
+  const u = (unit||'').toLowerCase();
+  if (['gr','gram','g'].includes(u)) return qty;
+  if (u==='kg')      return qty * 1000;
+  if (u==='ml')      return qty;
+  if (u==='litre')   return qty * 1000;
+  if (u==='dilim')   return qty * 30;
+  if (u==='bardak')  return qty * 240;
+  if (u==='kase')    return qty * 200;
+  return qty * 100; // porsiyon / adet / tane
 }
 
-// ── COMMAND HANDLERS ─────────────────────────────────────────────
-
+// ── HANDLERS ──────────────────────────────────────────────────────
 async function handleKilo(chatId, args) {
   const val = parseFloat(args[0]);
-  if (isNaN(val) || val < 30 || val > 300) {
-    return sendMsg(chatId, '⚠️ Geçersiz kilo. Örnek: `/kilo 105.2`');
-  }
-  await dbInsert('weight_log', { date: today(), weight: val });
-  sendMsg(chatId, `✅ *${val} kg* kaydedildi (${today()})`);
+  if (isNaN(val) || val < 30 || val > 300)
+    return send(chatId, '⚠️ Geçersiz değer.\nÖrnek: `/kilo 105.2`');
+  await dbUpsert('weight_log', { date: today(), weight: val });
+  send(chatId, `✅ *${val} kg* kaydedildi.`);
 }
 
 async function handleAntrenman(chatId, args) {
-  const gun = (args[0] || '').toUpperCase();
-  const validDays = ['A', 'B', 'C', 'D', 'REST'];
-  if (!validDays.includes(gun)) {
-    return sendMsg(chatId, '⚠️ Gün: A, B, C, D veya REST\nÖrnek: `/antrenman A`');
-  }
-  await dbInsert('workout_log', { date: today(), day: gun, notes: args.slice(1).join(' ') });
-  const emoji = gun === 'REST' ? '😴' : '💪';
-  sendMsg(chatId, `${emoji} *${gun} günü* kaydedildi!`);
+  const gun = (args[0]||'').toUpperCase();
+  if (!['A','B','C','D','REST'].includes(gun))
+    return send(chatId, '⚠️ Geçersiz gün.\nÖrnek: `/antrenman A` veya `/antrenman REST`');
+  await dbUpsert('workout_log', { date: today(), day: gun, notes: args.slice(1).join(' ') });
+  const label = gun === 'REST' ? '😴 Dinlenme günü' : `💪 ${gun} antrenmanı`;
+  send(chatId, `✅ *${label}* kaydedildi.`);
 }
 
 async function handleWatch(chatId, args) {
-  // /watch hrv:65 rhr:52 uyku:7.5 adim:9200 cal:420
+  // /watch hrv:65 rhr:52 uyku:7.5 adim:9200 cal:420 vo2:48
+  const MAP = { hrv:'hrv', rhr:'rhr', uyku:'sleep', adim:'steps', cal:'active_cal', vo2:'vo2' };
   const data = { date: today() };
   args.forEach(a => {
     const [k, v] = a.split(':');
-    if (k && v) {
-      const map = { hrv:'hrv', rhr:'rhr', uyku:'sleep', adim:'steps', cal:'active_cal', vo2:'vo2' };
-      if (map[k]) data[map[k]] = parseFloat(v);
-    }
+    if (MAP[k]) data[MAP[k]] = parseFloat(v);
   });
-  await dbInsert('watch_log', data);
-  sendMsg(chatId, `⌚ Apple Watch verileri kaydedildi!\n${JSON.stringify(data, null, 2)}`);
+  if (Object.keys(data).length <= 1)
+    return send(chatId, '⚠️ Veri bulunamadı.\nÖrnek: `/watch hrv:65 rhr:52 uyku:7.5 adim:9200 cal:420`');
+  await dbUpsert('watch_log', data);
+
+  let msg = `⌚ *Watch verileri kaydedildi*\n\n`;
+  if (data.hrv)        msg += `HRV: *${data.hrv}* ms\n`;
+  if (data.rhr)        msg += `Dinlenim KAH: *${data.rhr}* bpm\n`;
+  if (data.sleep)      msg += `Uyku: *${data.sleep}* saat\n`;
+  if (data.steps)      msg += `Adım: *${data.steps?.toLocaleString()}*\n`;
+  if (data.active_cal) msg += `Aktif kalori: *${data.active_cal}* kcal\n`;
+  if (data.vo2)        msg += `VO₂ max: *${data.vo2}*\n`;
+  send(chatId, msg);
 }
 
 async function handleYemek(chatId, text) {
-  const items = parseFoodText(text);
-  if (!items.length) return sendMsg(chatId, '⚠️ Yemek anlaşılamadı. Örnek: "2 yumurta ve 1 dilim ekmek yedim"');
+  const items = parseFood(text);
+  if (!items.length)
+    return send(chatId, '⚠️ Anlaşılamadı.\nÖrnek: "2 yumurta ve 150gr tavuk yedim"');
 
-  await sendMsg(chatId, '🔍 Besin değerleri aranıyor...');
+  await send(chatId, '🔍 Hesaplanıyor...');
 
   let totalKcal = 0, totalProtein = 0, totalCarb = 0, totalFat = 0;
-  let report = '*📊 Besin Analizi*\n\n';
-  const pendingLog = [];
+  let lines = '';
+  const log = [];
 
   for (const item of items) {
-    const results = await searchFood(item.food);
-    if (!results.length) {
-      report += `❓ *${item.food}* — bulunamadı\n`;
-      continue;
-    }
-    const r = results[0];
-    const grams = toGrams(item.qty, item.unit, 100);
-    const factor = grams / 100;
-    const kcal    = Math.round(r.kcal100 * factor);
-    const protein = Math.round(r.protein100 * factor);
-    const carb    = Math.round(r.carb100 * factor);
-    const fat     = Math.round(r.fat100 * factor);
-
-    totalKcal    += kcal;
-    totalProtein += protein;
-    totalCarb    += carb;
-    totalFat     += fat;
-
-    report += `• *${item.qty} ${item.unit} ${item.food}* (~${grams}g)\n`;
-    report += `  🔥 ${kcal} kcal | 💪 ${protein}g P | 🍞 ${carb}g K | 🧈 ${fat}g Y\n\n`;
-
-    pendingLog.push({ name: r.name, qty: item.qty, unit: item.unit, grams, kcal, protein, carb, fat });
+    const [r] = await searchFood(item.food);
+    if (!r) { lines += `❓ *${item.food}* bulunamadı\n`; continue; }
+    const g = toGrams(item.qty, item.unit);
+    const f = g / 100;
+    const kcal = Math.round(r.kcal * f), protein = Math.round(r.protein * f);
+    const carb = Math.round(r.carb * f), fat = Math.round(r.fat * f);
+    totalKcal += kcal; totalProtein += protein; totalCarb += carb; totalFat += fat;
+    lines += `▸ *${item.qty} ${item.unit} ${item.food}* (${g}g)\n`;
+    lines += `  ${kcal} kcal · ${protein}g P · ${carb}g K · ${fat}g Y\n`;
+    log.push({ name: r.name, qty: item.qty, unit: item.unit, grams: g, kcal, protein, carb, fat });
   }
 
-  report += `─────────────────\n`;
-  report += `*TOPLAM: ${totalKcal} kcal*\n`;
-  report += `💪 Protein: ${totalProtein}g | 🍞 Karb: ${totalCarb}g | 🧈 Yağ: ${totalFat}g\n\n`;
-  report += `Hedef: 3250 kcal | Kalan: ${3250 - totalKcal} kcal`;
+  // Günlük kalan ile birleştir
+  const existing = await dbToday('macro_log');
+  const newKcal  = (existing?.kcal    || 0) + totalKcal;
+  const newP     = (existing?.protein || 0) + totalProtein;
+  const newC     = (existing?.carb    || 0) + totalCarb;
+  const newF     = (existing?.fat     || 0) + totalFat;
+  await dbUpsert('macro_log', {
+    date: today(), kcal: newKcal, protein: newP, carb: newC, fat: newF,
+    foods: JSON.stringify([...(JSON.parse(existing?.foods||'[]')), ...log])
+  });
 
-  // Supabase'e kaydet
-  const existing = await dbGetToday('macro_log');
-  const newMacro = {
-    date: today(),
-    kcal: (existing?.kcal || 0) + totalKcal,
-    protein: (existing?.protein || 0) + totalProtein,
-    carb: (existing?.carb || 0) + totalCarb,
-    fat: (existing?.fat || 0) + totalFat,
-    foods: JSON.stringify([...(JSON.parse(existing?.foods || '[]')), ...pendingLog])
-  };
-  await dbInsert('macro_log', newMacro);
+  const kalan = KCAL_HEDEF - newKcal;
+  const prog  = bar(newKcal, KCAL_HEDEF);
 
-  sendMsg(chatId, report);
+  let msg = `*🍽 Yemek kaydedildi*\n\n`;
+  msg += lines;
+  msg += `\n`;
+  msg += `Bu öğün: *${totalKcal} kcal*\n`;
+  msg += `Protein: ${totalProtein}g · Karb: ${totalCarb}g · Yağ: ${totalFat}g\n`;
+  msg += `\n`;
+  msg += `*Günlük toplam*\n`;
+  msg += `${prog} ${newKcal}/${KCAL_HEDEF} kcal\n`;
+  msg += kalan > 0 ? `Kalan: *${kalan} kcal*` : `🎯 Hedefe ulaşıldı!`;
+  send(chatId, msg);
 }
 
 async function handleRapor(chatId) {
   const [w, m, wo, wt] = await Promise.all([
-    dbGetToday('weight_log'),
-    dbGetToday('macro_log'),
-    dbGetToday('workout_log'),
-    dbGetToday('watch_log'),
+    dbToday('weight_log'), dbToday('macro_log'),
+    dbToday('workout_log'), dbToday('watch_log'),
   ]);
 
-  let msg = `*📋 Günlük Rapor — ${today()}*\n\n`;
-  msg += w  ? `⚖️ Kilo: *${w.weight} kg*\n` : '⚖️ Kilo: —\n';
-  msg += wo ? `💪 Antrenman: *${wo.day} günü*\n` : '💪 Antrenman: —\n';
-  msg += m  ? `🔥 Kalori: *${m.kcal}* / 3250 kcal\n` : '🔥 Kalori: —\n';
-  msg += m  ? `  Protein: ${m.protein}g / 233g | Karb: ${m.carb}g | Yağ: ${m.fat}g\n` : '';
-  msg += wt ? `❤️ HRV: ${wt.hrv||'—'} | DKH: ${wt.rhr||'—'} | Uyku: ${wt.sleep||'—'}s\n` : '';
-  msg += wt ? `👟 Adım: ${wt.steps||'—'} | Aktif: ${wt.active_cal||'—'} kcal\n` : '';
+  const kcal = m?.kcal || 0;
+  const prog  = bar(kcal, KCAL_HEDEF);
+  const kalan = KCAL_HEDEF - kcal;
 
-  sendMsg(chatId, msg);
+  let msg = `*📋 Günlük Özet — ${today()}*\n\n`;
+
+  // Vücut & Antrenman
+  msg += `⚖️  Kilo: ${w ? `*${w.weight} kg*` : '—'}\n`;
+  msg += `💪  Antrenman: ${wo ? `*${wo.day} günü*` : '—'}\n\n`;
+
+  // Kalori
+  msg += `*Kalori*\n`;
+  msg += `${prog} ${kcal}/${KCAL_HEDEF}\n`;
+  if (m) {
+    msg += `P: ${m.protein}g/${PROTEIN_HEDEF}g · K: ${m.carb}g · Y: ${m.fat}g\n`;
+    msg += kalan > 0 ? `Kalan: ${kalan} kcal\n` : `🎯 Hedefe ulaşıldı!\n`;
+  }
+
+  // Watch
+  if (wt) {
+    msg += `\n*Apple Watch*\n`;
+    if (wt.hrv)        msg += `HRV: *${wt.hrv}* ms · DKH: *${wt.rhr||'—'}* bpm\n`;
+    if (wt.sleep)      msg += `Uyku: *${wt.sleep}* saat\n`;
+    if (wt.steps)      msg += `Adım: *${wt.steps?.toLocaleString()}* · Aktif: *${wt.active_cal||'—'}* kcal\n`;
+    if (wt.vo2)        msg += `VO₂ max: *${wt.vo2}*\n`;
+  }
+
+  send(chatId, msg);
 }
 
 async function handleHelp(chatId) {
-  sendMsg(chatId, `*🏋️ Onur Fitness Bot — Komutlar*\n
-📝 *Yemek logla:*
-"2 yumurta ve 1 dilim ekmek yedim"
-"150gr tavuk göğsü ve 1 kase pirinç yedim"
+  send(chatId, `*🏋️ Fitness Bot*
 
-⚖️ */kilo 105.2* — kilo kaydet
-💪 */antrenman A* — antrenman günü kaydet (A/B/C/D/REST)
-⌚ */watch hrv:65 rhr:52 uyku:7.5 adim:9200 cal:420*
-📋 */rapor* — günlük özet
-❓ */yardim* — bu menü`);
+*Yemek logla:*
+"2 yumurta yedim"
+"150gr tavuk ve 1 kase pirinç yedim"
+
+*Komutlar:*
+/kilo 105.2 — kilo kaydet
+/antrenman A — gün kaydet (A/B/C/D/REST)
+/watch hrv:65 rhr:52 uyku:7.5 adim:9200 cal:420
+/rapor — günlük özet
+/yardim — bu menü`);
 }
 
-// ── WEBHOOK ──────────────────────────────────────────────────────
+// ── WEBHOOK ───────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
-    const msg = req.body?.message;
+    const msg    = req.body?.message;
     if (!msg) return;
     const chatId = msg.chat.id;
     const text   = (msg.text || '').trim();
 
-    if (text.startsWith('/kilo')) {
-      await handleKilo(chatId, text.split(' ').slice(1));
-    } else if (text.startsWith('/antrenman')) {
-      await handleAntrenman(chatId, text.split(' ').slice(1));
-    } else if (text.startsWith('/watch')) {
-      await handleWatch(chatId, text.split(' ').slice(1));
-    } else if (text.startsWith('/rapor')) {
-      await handleRapor(chatId);
-    } else if (text.startsWith('/yardim') || text.startsWith('/start') || text.startsWith('/help')) {
-      await handleHelp(chatId);
-    } else if (/yedim|içtim/i.test(text)) {
-      await handleYemek(chatId, text);
-    } else {
-      await sendMsg(chatId, '❓ Anlamadım. /yardim yaz.');
-    }
+    if      (text.startsWith('/kilo'))       await handleKilo(chatId, text.split(' ').slice(1));
+    else if (text.startsWith('/antrenman'))  await handleAntrenman(chatId, text.split(' ').slice(1));
+    else if (text.startsWith('/watch'))      await handleWatch(chatId, text.split(' ').slice(1));
+    else if (text.startsWith('/rapor'))      await handleRapor(chatId);
+    else if (/\/yardim|\/start|\/help/i.test(text)) await handleHelp(chatId);
+    else if (/yedim|içtim/i.test(text))     await handleYemek(chatId, text);
+    else await send(chatId, '❓ Anlamadım.\n/yardim — komutları gör');
   } catch (e) {
     console.error('Webhook error:', e);
   }
 });
 
-// ── DATA API (dashboard için) ────────────────────────────────────
+// ── API & HEALTH ──────────────────────────────────────────────────
 app.get('/api/data', async (req, res) => {
   if (!supabase) return res.json({ error: 'Supabase bağlı değil' });
   const [weight, macros, workouts, watch] = await Promise.all([
@@ -253,14 +266,14 @@ app.get('/api/data', async (req, res) => {
     supabase.from('watch_log').select('*').order('date', { ascending: false }).limit(30),
   ]);
   res.json({
-    weight:   weight.data || [],
-    macros:   macros.data || [],
+    weight:   weight.data   || [],
+    macros:   macros.data   || [],
     workouts: workouts.data || [],
-    watch:    watch.data || [],
+    watch:    watch.data    || [],
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/health', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Fitness Bot çalışıyor — port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Fitness Bot — port ${PORT}`));
