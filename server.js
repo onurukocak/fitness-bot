@@ -10,11 +10,13 @@ const app = express();
 app.use(express.json());
 
 // ── CONFIG ────────────────────────────────────────────────────────
-const BOT_TOKEN      = process.env.BOT_TOKEN      || '8566167507:AAFuXsuyrVbx20lm0gPZVbvdlHBPew7Dc5k';
-const SUPABASE_URL   = process.env.SUPABASE_URL;
-const SUPABASE_KEY   = process.env.SUPABASE_KEY;
-const CALORIE_NINJAS = process.env.CALORIE_NINJAS || ''; // https://calorieninjas.com/api — ücretsiz kayıt
-const TG             = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const BOT_TOKEN        = process.env.BOT_TOKEN        || '8566167507:AAFuXsuyrVbx20lm0gPZVbvdlHBPew7Dc5k';
+const SUPABASE_URL     = process.env.SUPABASE_URL;
+const SUPABASE_KEY     = process.env.SUPABASE_KEY;
+const CALORIE_NINJAS   = process.env.CALORIE_NINJAS   || '';
+const FATSECRET_KEY    = process.env.FATSECRET_KEY    || '';  // platform.fatsecret.com → My App → Client ID
+const FATSECRET_SECRET = process.env.FATSECRET_SECRET || '';  // platform.fatsecret.com → My App → Client Secret
+const TG               = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const KCAL_HEDEF     = 3250;
 const PROTEIN_HEDEF  = 233;
 
@@ -218,7 +220,79 @@ function lookupLocal(query) {
   return null;
 }
 
-// 2. CalorieNinjas API (ücretsiz, İngilizce ve Türkçe çalışır)
+// 2. FatSecret Platform API (OAuth 2.0 — en kapsamlı veritabanı)
+let _fsToken = null;
+let _fsTokenExpiry = 0;
+
+async function getFatSecretToken() {
+  if (_fsToken && Date.now() < _fsTokenExpiry) return _fsToken;
+  if (!FATSECRET_KEY || !FATSECRET_SECRET) return null;
+  try {
+    const creds = Buffer.from(`${FATSECRET_KEY}:${FATSECRET_SECRET}`).toString('base64');
+    const res   = await fetch('https://oauth.fatsecret.com/connect/token', {
+      method:  'POST',
+      headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    'grant_type=client_credentials&scope=basic'
+    });
+    const data = await res.json();
+    if (data.access_token) {
+      _fsToken       = data.access_token;
+      _fsTokenExpiry = Date.now() + ((data.expires_in || 86400) - 300) * 1000;
+      return _fsToken;
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function lookupFatSecret(query) {
+  const token = await getFatSecretToken();
+  if (!token) return null;
+  try {
+    const url = `https://platform.fatsecret.com/rest/server.api` +
+      `?method=foods.search&search_expression=${encodeURIComponent(query)}&format=json&max_results=5`;
+    const res  = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+    const data = await res.json();
+
+    const raw = data.foods?.food;
+    if (!raw) return null;
+    const list = Array.isArray(raw) ? raw : [raw];
+
+    for (const food of list) {
+      const desc = food.food_description || '';
+      // Örnek: "Per 100g - Calories: 165kcal | Fat: 3.60g | Carbs: 0.00g | Protein: 31.00g"
+      // ya da: "Per 1 serving (85g) - Calories: ..."
+      const kcalM = desc.match(/Calories:\s*([\d.]+)kcal/i);
+      const fatM  = desc.match(/Fat:\s*([\d.]+)g/i);
+      const carbM = desc.match(/Carbs:\s*([\d.]+)g/i);
+      const protM = desc.match(/Protein:\s*([\d.]+)g/i);
+      if (!kcalM) continue;
+
+      let kcal = parseFloat(kcalM[1]);
+      let fat  = parseFloat(fatM?.[1]  || 0);
+      let carb = parseFloat(carbM?.[1] || 0);
+      let prot = parseFloat(protM?.[1] || 0);
+
+      // Per 100g değil mi? Porsiyona göre normalize et
+      const per100 = /per 100g/i.test(desc);
+      if (!per100) {
+        const servM = desc.match(/per [^(]*\((\d+(?:\.\d+)?)g\)/i);
+        const g     = servM ? parseFloat(servM[1]) : 100;
+        if (g !== 100 && g > 0) {
+          const f = 100 / g;
+          kcal = Math.round(kcal * f);
+          fat  = Math.round(fat  * f * 10) / 10;
+          carb = Math.round(carb * f * 10) / 10;
+          prot = Math.round(prot * f * 10) / 10;
+        }
+      }
+
+      return { name: food.food_name, kcal, p: prot, c: carb, f: fat, source: 'fatsecret' };
+    }
+    return null;
+  } catch (e) { console.error('FatSecret hata:', e.message); return null; }
+}
+
+// 3. CalorieNinjas API (yedek)
 async function lookupCalorieNinjas(query) {
   if (!CALORIE_NINJAS) return null;
   try {
@@ -239,7 +313,7 @@ async function lookupCalorieNinjas(query) {
   } catch { return null; }
 }
 
-// 3. OpenFoodFacts (son çare)
+// 4. OpenFoodFacts (son çare)
 async function lookupOpenFoodFacts(query) {
   try {
     const url  = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1&page_size=5&fields=product_name,nutriments`;
@@ -259,9 +333,10 @@ async function lookupOpenFoodFacts(query) {
 }
 
 async function findFood(query) {
-  return lookupLocal(query)
-    || await lookupCalorieNinjas(query)
-    || await lookupOpenFoodFacts(query)
+  return lookupLocal(query)              // 1. Türkçe DB (hızlı)
+    || await lookupFatSecret(query)      // 2. FatSecret (kapsamlı, 80+ milyon gıda)
+    || await lookupCalorieNinjas(query)  // 3. CalorieNinjas (yedek)
+    || await lookupOpenFoodFacts(query)  // 4. OpenFoodFacts (son çare)
     || null;
 }
 
@@ -364,7 +439,8 @@ async function handleYemek(chatId, text) {
     const carb = Math.round(r.c   * fac);
     const fat  = Math.round(r.f   * fac);
     totalKcal += kcal; totalP += prot; totalC += carb; totalF += fat;
-    lines += `▸ *${item.qty} ${item.unit} ${item.food}* (${g}g)\n`;
+    const srcEmoji = r.source === 'fatsecret' ? '🟢' : r.source === 'local' ? '🏠' : r.source === 'calorieninjas' ? '🔵' : '⚪';
+    lines += `▸ *${item.qty} ${item.unit} ${item.food}* (${g}g) ${srcEmoji}\n`;
     lines += `  ${kcal} kcal · ${prot}g P · ${carb}g K · ${fat}g Y\n`;
     log.push({ name: r.name, qty: item.qty, unit: item.unit, grams: g, kcal, protein: prot, carb, fat });
   }
